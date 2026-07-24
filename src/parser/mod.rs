@@ -134,7 +134,10 @@ impl std::fmt::Display for ParseError {
             ParseError::HwpxError(e) => write!(f, "HWPX 오류: {}", e),
             ParseError::Hwp3Error(e) => write!(f, "HWP 3.0 오류: {}", e),
             ParseError::HmlError(e) => write!(f, "HML 오류: {}", e),
-            ParseError::EncryptedDocument => write!(f, "암호화된 문서는 지원하지 않습니다"),
+            ParseError::EncryptedDocument => write!(
+                f,
+                "비밀번호가 필요한 암호 문서입니다 (parse_hwp_with_password 로 비밀번호를 전달하세요)"
+            ),
             ParseError::UnsupportedFormat { code, format, hint } => {
                 write!(
                     f,
@@ -173,9 +176,22 @@ impl From<hml::HmlError> for ParseError {
 /// 3. DocInfo 파싱 (참조 테이블)
 /// 4. BodyText 섹션별 파싱 (배포용 문서: ViewText 복호화)
 pub fn parse_hwp(data: &[u8]) -> Result<Document, ParseError> {
+    parse_hwp_inner(data, None)
+}
+
+/// 비밀번호로 보호된 HWP 파일을 비밀번호와 함께 파싱한다.
+///
+/// `encrypted` 플래그가 설정된 문서(보안수준 높음)를 연다. 비밀번호가 틀리면
+/// `ParseError::CryptoError(CryptoError::WrongPassword)` 가 반환된다. 비밀번호가
+/// 필요 없는 일반/배포용 문서에 비밀번호를 전달해도 결과는 동일하다(무시됨).
+pub fn parse_hwp_with_password(data: &[u8], password: &[u8]) -> Result<Document, ParseError> {
+    parse_hwp_inner(data, Some(password))
+}
+
+fn parse_hwp_inner(data: &[u8], password: Option<&[u8]>) -> Result<Document, ParseError> {
     // 1. CFB 컨테이너 열기 (strict → lenient 폴백)
     match cfb_reader::CfbReader::open(data) {
-        Ok(cfb) => parse_hwp_with_cfb(cfb, data),
+        Ok(cfb) => parse_hwp_with_cfb(cfb, data, password),
         Err(strict_err) => {
             eprintln!(
                 "표준 CFB 파서 실패: {}, lenient 파서로 재시도...",
@@ -183,7 +199,7 @@ pub fn parse_hwp(data: &[u8]) -> Result<Document, ParseError> {
             );
             let lenient = cfb_reader::LenientCfbReader::open(data)
                 .map_err(|_| ParseError::CfbError(strict_err))?;
-            parse_hwp_with_lenient(lenient, data)
+            parse_hwp_with_lenient(lenient, data, password)
         }
     }
 }
@@ -192,34 +208,65 @@ pub fn parse_hwp(data: &[u8]) -> Result<Document, ParseError> {
 fn parse_hwp_with_cfb(
     mut cfb: cfb_reader::CfbReader,
     raw_data: &[u8],
+    password: Option<&[u8]>,
 ) -> Result<Document, ParseError> {
     // 2. FileHeader 파싱
     let header_data = cfb.read_file_header().map_err(ParseError::CfbError)?;
     let file_header = header::parse_file_header(&header_data).map_err(ParseError::HeaderError)?;
 
-    if file_header.flags.encrypted {
+    let encrypted = file_header.flags.encrypted;
+    // 비밀번호 암호 문서인데 비밀번호가 없으면 열 수 없다.
+    // 비밀번호가 제공되지 않은 경우 기존과 동일하게 EncryptedDocument 에러로
+    // 호출자가 비밀번호 입력을 유도할 수 있게 한다.
+    if encrypted && password.is_none() {
         return Err(ParseError::EncryptedDocument);
     }
 
     let compressed = file_header.flags.compressed;
     let distribution = file_header.flags.distribution;
 
-    // 3. DocInfo 파싱
-    let doc_info_data = cfb
-        .read_doc_info(compressed)
-        .map_err(ParseError::CfbError)?;
+    // 3. DocInfo 파싱 (비밀번호 암호 문서: raw 읽기 → 복호화)
+    //
+    // TODO(보안수준 보통/구버전): 현재는 "보안수준 높음"(한글 2020+ 기본, AES 기반)
+    // 만 지원한다. encrypt_version 이 보통(legacy) 인 파일은 별도 복호화 경로가
+    // 필요하다 — 알고리즘은 KCI 2024 논문(윤희서 외, "보안수준보통으로 암호화된
+    // 한글 문서 파일 구조 5.0에 대한 hwp 파일 복호화 방안 연구") 참조. 높음 경로가
+    // WrongPassword 를 반환한 경우 보통 시도로 폴백하는 분기를 여기에 추가한다.
+    let doc_info_data = if encrypted {
+        let raw = cfb
+            .read_stream_raw("/DocInfo")
+            .map_err(ParseError::CfbError)?;
+        crypto::decrypt_password_protected(&raw, password.unwrap(), compressed)
+            .map_err(ParseError::CryptoError)?
+    } else {
+        cfb.read_doc_info(compressed)
+            .map_err(ParseError::CfbError)?
+    };
     let (mut doc_info, doc_properties) =
         doc_info::parse_doc_info(&doc_info_data).map_err(ParseError::DocInfoError)?;
     doc_info.raw_stream = Some(doc_info_data);
 
     // 4. BodyText 섹션별 파싱
     let section_count = cfb.section_count();
-    let sections = parse_sections_strict(&mut cfb, section_count, compressed, distribution)?;
+    let sections = parse_sections_strict(
+        &mut cfb,
+        section_count,
+        compressed,
+        distribution,
+        encrypted,
+        password,
+    )?;
 
     // 5-7. 미리보기, BinData, 추가 스트림
     let preview = extract_preview(&mut cfb);
-    let bin_data_content =
-        load_bin_data_content(&mut cfb, raw_data, &doc_info.bin_data_list, compressed);
+    let bin_data_content = load_bin_data_content(
+        &mut cfb,
+        raw_data,
+        &doc_info.bin_data_list,
+        compressed,
+        encrypted,
+        password,
+    );
     let extra_streams = collect_extra_streams(&mut cfb, &doc_info.bin_data_list, &bin_data_content);
 
     // Document 조립
@@ -439,11 +486,14 @@ fn apply_hwp3_origin_fixup(doc: &mut Document) {
 }
 
 /// CfbReader로 섹션들 파싱
+#[allow(clippy::too_many_arguments)]
 fn parse_sections_strict(
     cfb: &mut cfb_reader::CfbReader,
     section_count: u32,
     compressed: bool,
     distribution: bool,
+    encrypted: bool,
+    password: Option<&[u8]>,
 ) -> Result<Vec<crate::model::document::Section>, ParseError> {
     let mut sections = Vec::new();
 
@@ -454,6 +504,16 @@ fn parse_sections_strict(
                 .read_body_text_section(i, compressed, true)
                 .map_err(ParseError::CfbError)?;
             crypto::decrypt_viewtext_section(&raw, compressed).map_err(ParseError::CryptoError)?
+        } else if encrypted {
+            // 비밀번호 암호 문서: BodyText raw → 비밀번호 복호화.
+            // read_body_text_section(compressed=false) 가 스트림 경로 탐색
+            // (BodyText/Section{i} → /Section{i}) 을 담당하므로 raw 만 얻어
+            // 복호화+압축해제는 crypto 로 위임한다.
+            let raw = cfb
+                .read_body_text_section(i, false, false)
+                .map_err(ParseError::CfbError)?;
+            crypto::decrypt_password_protected(&raw, password.unwrap(), compressed)
+                .map_err(ParseError::CryptoError)?
         } else {
             cfb.read_body_text_section(i, compressed, false)
                 .map_err(ParseError::CfbError)?
@@ -480,22 +540,32 @@ fn parse_sections_strict(
 fn parse_hwp_with_lenient(
     lenient: cfb_reader::LenientCfbReader,
     _raw_data: &[u8],
+    password: Option<&[u8]>,
 ) -> Result<Document, ParseError> {
     // FileHeader 파싱
     let header_data = lenient.read_file_header().map_err(ParseError::CfbError)?;
     let file_header = header::parse_file_header(&header_data).map_err(ParseError::HeaderError)?;
 
-    if file_header.flags.encrypted {
+    let encrypted = file_header.flags.encrypted;
+    if encrypted && password.is_none() {
         return Err(ParseError::EncryptedDocument);
     }
 
     let compressed = file_header.flags.compressed;
     let distribution = file_header.flags.distribution;
 
-    // DocInfo 파싱
-    let doc_info_data = lenient
-        .read_doc_info(compressed)
-        .map_err(ParseError::CfbError)?;
+    // DocInfo 파싱 (비밀번호 암호 문서: lenient read_stream raw → 복호화)
+    let doc_info_data = if encrypted {
+        let raw = lenient
+            .read_stream("DocInfo")
+            .map_err(ParseError::CfbError)?;
+        crypto::decrypt_password_protected(&raw, password.unwrap(), compressed)
+            .map_err(ParseError::CryptoError)?
+    } else {
+        lenient
+            .read_doc_info(compressed)
+            .map_err(ParseError::CfbError)?
+    };
     let (mut doc_info, doc_properties) =
         doc_info::parse_doc_info(&doc_info_data).map_err(ParseError::DocInfoError)?;
     doc_info.raw_stream = Some(doc_info_data);
@@ -510,6 +580,15 @@ fn parse_hwp_with_lenient(
                 .read_body_text_section_full(i, compressed, true)
                 .map_err(ParseError::CfbError)?;
             crypto::decrypt_viewtext_section(&raw, compressed).map_err(ParseError::CryptoError)?
+        } else if encrypted {
+            // 비밀번호 암호 문서: lenient reader 로 raw 섹션 바이트를 얻어 복호화.
+            // read_body_text_section_full(compressed=false, distribution=false) 가
+            // Section{i} raw 를 반환한다.
+            let raw = lenient
+                .read_body_text_section_full(i, false, false)
+                .map_err(ParseError::CfbError)?;
+            crypto::decrypt_password_protected(&raw, password.unwrap(), compressed)
+                .map_err(ParseError::CryptoError)?
         } else {
             lenient
                 .read_body_text_section_full(i, compressed, false)
@@ -529,7 +608,13 @@ fn parse_hwp_with_lenient(
     }
 
     // BinData 로드 시도
-    let bin_data_content = load_bin_data_content_lenient(&lenient, &doc_info.bin_data_list);
+    let bin_data_content = load_bin_data_content_lenient(
+        &lenient,
+        &doc_info.bin_data_list,
+        encrypted,
+        compressed,
+        password,
+    );
 
     // Document 조립 (preview, extra_streams는 lenient에서 생략)
     let model_header = ModelFileHeader {
@@ -591,6 +676,9 @@ fn parse_hwp_with_lenient(
 fn load_bin_data_content_lenient(
     lenient: &cfb_reader::LenientCfbReader,
     bin_data_list: &[crate::model::bin_data::BinData],
+    encrypted: bool,
+    compressed: bool,
+    password: Option<&[u8]>,
 ) -> Vec<BinDataContent> {
     use crate::model::bin_data::BinDataType;
 
@@ -612,9 +700,23 @@ fn load_bin_data_content_lenient(
 
         match lenient.read_stream(&storage_name) {
             Ok(data) => {
-                let mut decompressed = match cfb_reader::decompress_stream(&data) {
-                    Ok(d) => d,
-                    Err(_) => data,
+                let mut decompressed = if encrypted {
+                    let pwd = password.unwrap();
+                    match crypto::decrypt_password_protected(&data, pwd, compressed) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!(
+                                "경고: BinData '{}' 복호화 실패 (lenient): {}",
+                                storage_name, e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match cfb_reader::decompress_stream(&data) {
+                        Ok(d) => d,
+                        Err(_) => data,
+                    }
                 };
 
                 // Task #195 단계 6: OLE Storage는 CFB 매직 바로 앞의 4-byte size prefix 스킵
@@ -1006,8 +1108,26 @@ pub struct ParsedDocument {
 
 /// 포맷 자동 감지 후 공통 IR과 입력 메타데이터를 파싱한다.
 pub fn parse_document_with_metadata(data: &[u8]) -> Result<ParsedDocument, ParseError> {
+    parse_document_inner(data, None)
+}
+
+/// 포맷 자동 감지 후 비밀번호와 함께 파싱한다.
+///
+/// 비밀번호 암호 문서(보안수준 높음)를 연다. 비밀번호가 틀리면
+/// `CryptoError::WrongPassword` 가 반환된다.
+pub fn parse_document_with_metadata_password(
+    data: &[u8],
+    password: &[u8],
+) -> Result<ParsedDocument, ParseError> {
+    parse_document_inner(data, Some(password))
+}
+
+fn parse_document_inner(
+    data: &[u8],
+    password: Option<&[u8]>,
+) -> Result<ParsedDocument, ParseError> {
     match detect_format(data) {
-        FileFormat::Hwp => HwpParser.parse(data).map(without_hml_metadata),
+        FileFormat::Hwp => parse_hwp_inner(data, password).map(without_hml_metadata),
         FileFormat::Hwpx => HwpxParser.parse(data).map(without_hml_metadata),
         FileFormat::Hwp3 => Hwp3Parser.parse(data).map(without_hml_metadata),
         FileFormat::Hml => {
@@ -1293,13 +1413,37 @@ struct Hwp5BinResolver {
     cfb: std::sync::Mutex<cfb_reader::CfbReader>,
     /// 선두 4-byte size prefix 정규화가 필요한 OLE Storage 스트림명
     ole_streams: std::collections::HashSet<String>,
+    /// 비밀번호 암호 문서 여부 (FileHeader encrypted 플래그)
+    encrypted: bool,
+    /// 본문 스트림 압축 여부 (FileHeader compressed 플래그)
+    compressed: bool,
+    /// 비밀번호 바이트. 지연 로딩이 파싱 이후 렌더 시점에 스트림을 읽으므로
+    /// 리졸버가 바이트를 소유해야 한다.
+    password: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Hwp5BinResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hwp5BinResolver")
             .field("ole_streams", &self.ole_streams.len())
+            .field("encrypted", &self.encrypted)
             .finish()
+    }
+}
+
+impl Hwp5BinResolver {
+    /// raw BinData 바이트를 복호화(암호 문서)+압축 해제한다.
+    /// 비암호 문서에서 압축 해제 실패 시 원본을 그대로 반환한다(기존 동작).
+    fn try_decode(&self, raw: &[u8]) -> Option<Vec<u8>> {
+        if self.encrypted {
+            let pwd = self.password.as_deref().unwrap_or(&[]);
+            crypto::decrypt_password_protected(raw, pwd, self.compressed).ok()
+        } else {
+            match cfb_reader::decompress_stream(raw) {
+                Ok(d) => Some(d),
+                Err(_) => Some(raw.to_vec()),
+            }
+        }
     }
 }
 
@@ -1317,10 +1461,15 @@ impl crate::model::bin_data::BinDataResolver for Hwp5BinResolver {
             }
         };
 
-        // 압축 해제 실패 시 원본 사용 (비압축 데이터)
-        let mut decompressed = match cfb_reader::decompress_stream(&raw) {
-            Ok(d) => d,
-            Err(_) => raw,
+        let mut decompressed = match self.try_decode(&raw) {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "경고: BinData '{}' 복호화 실패 (비밀번호 불일치 또는 손상)",
+                    key
+                );
+                return Vec::new();
+            }
         };
 
         // Task #195 단계 6: OLE Storage는 해제 후 선두 4바이트 size prefix를 스킵하여
@@ -1340,18 +1489,33 @@ impl crate::model::bin_data::BinDataResolver for Hwp5BinResolver {
             Ok(cfb) => cfb,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let raw = match cfb.read_bin_data_limited(key, max_bytes) {
-            Ok(data) => data,
-            Err(error) => {
-                eprintln!("경고: BinData '{}' bounded 로드 실패: {}", key, error);
-                return None;
+        // 암호 문서는 블록 단위 복호화가 전체 스트림을 요구하므로 제한 없이 읽는다.
+        let raw = if self.encrypted {
+            match cfb.read_bin_data(key) {
+                Ok(data) => data,
+                Err(error) => {
+                    eprintln!("경고: BinData '{}' bounded 로드 실패: {}", key, error);
+                    return None;
+                }
+            }
+        } else {
+            match cfb.read_bin_data_limited(key, max_bytes) {
+                Ok(data) => data,
+                Err(error) => {
+                    eprintln!("경고: BinData '{}' bounded 로드 실패: {}", key, error);
+                    return None;
+                }
             }
         };
 
-        let mut bytes = match cfb_reader::decompress_stream_limited(&raw, max_bytes) {
-            Ok(data) => data,
-            Err(cfb_reader::CfbError::LimitExceeded(_)) => return None,
-            Err(_) => raw,
+        let mut bytes = if self.encrypted {
+            self.try_decode(&raw)?
+        } else {
+            match cfb_reader::decompress_stream_limited(&raw, max_bytes) {
+                Ok(data) => data,
+                Err(cfb_reader::CfbError::LimitExceeded(_)) => return None,
+                Err(_) => raw,
+            }
         };
         if self.ole_streams.contains(key) && bytes.len() >= 12 {
             let cfb_magic = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -1367,7 +1531,9 @@ fn load_bin_data_content(
     cfb: &mut cfb_reader::CfbReader,
     data: &[u8],
     bin_data_list: &[crate::model::bin_data::BinData],
-    _compressed: bool,
+    compressed: bool,
+    encrypted: bool,
+    password: Option<&[u8]>,
 ) -> Vec<BinDataContent> {
     use crate::model::bin_data::BinDataType;
 
@@ -1385,6 +1551,9 @@ fn load_bin_data_content(
             Ok(reader) => Some(std::sync::Arc::new(Hwp5BinResolver {
                 cfb: std::sync::Mutex::new(reader),
                 ole_streams,
+                encrypted,
+                compressed,
+                password: password.map(|p| p.to_vec()),
             })),
             Err(e) => {
                 // 리졸버를 못 열면 지연 로딩 불가 — 기존처럼 즉시 로드로 폴백한다.
@@ -1438,10 +1607,24 @@ fn load_bin_data_content(
 
         match cfb.read_bin_data(&storage_name) {
             Ok(data) => {
-                // 압축된 BinData 해제 시도
-                let mut decompressed = match cfb_reader::decompress_stream(&data) {
-                    Ok(d) => d,
-                    Err(_) => data, // 압축 해제 실패 시 원본 사용 (비압축 데이터)
+                // 암호 문서: 복호화+압축해제. 그 외: 압축 해제 시도 (실패 시 원본).
+                let mut decompressed = if encrypted {
+                    let pwd = password.unwrap();
+                    match crypto::decrypt_password_protected(&data, pwd, compressed) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!(
+                                "경고: BinData '{}' 복호화 실패 (비밀번호 불일치?): {}",
+                                storage_name, e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match cfb_reader::decompress_stream(&data) {
+                        Ok(d) => d,
+                        Err(_) => data, // 압축 해제 실패 시 원본 사용 (비압축 데이터)
+                    }
                 };
 
                 // Task #195 단계 6: OLE Storage는 해제 후 선두 4바이트 size prefix를 스킵하여
@@ -1730,5 +1913,51 @@ mod tests {
         }
         let result = MockParser.parse(&[]);
         assert!(result.is_err());
+    }
+
+    /// 비밀번호 암호 라우팅 검증: 일반 샘플의 FileHeader 에서 encrypted 비트만
+    /// 켠 변형을 만들어 (스트림 자체는 암호화하지 않음) 파서의 분기를 확인한다.
+    ///
+    /// - 비밀번호 없음 → ParseError::EncryptedDocument
+    /// - 비밀번호 제공(틀림) → 실제 복호화 시도 후 WrongPassword (압축 해제 실패)
+    /// - 원본은 여전히 정상 파싱 (회귀 없음)
+    #[test]
+    fn test_encrypted_flag_routes_password_paths() {
+        let original = std::fs::read("samples/2010-01-06.hwp").expect("sample 존재");
+        // 원본 정상 파싱 (회귀 가드)
+        assert!(parse_document(&original).is_ok(), "원본은 파싱되어야 함");
+
+        // cfb 컨테이너를 열어 FileHeader 의 encrypted 비트(bit1)만 켠다.
+        // FileHeader 는 고정 256바이트 스트림이므로 offset 36의 flags 4바이트를
+        // in-place 로 덮어쓴다.
+        let mut cursor = std::io::Cursor::new(original.clone());
+        let mut cfb = cfb::CompoundFile::open(&mut cursor).expect("cfb open");
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut stream = cfb.open_stream("/FileHeader").expect("FileHeader 스트림");
+            stream.seek(SeekFrom::Start(36)).unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).unwrap();
+            let flags = u32::from_le_bytes(buf);
+            stream.seek(SeekFrom::Start(36)).unwrap();
+            stream.write_all(&(flags | 0x02).to_le_bytes()).unwrap();
+        }
+        drop(cfb);
+        let modified = cursor.into_inner();
+
+        // 1) 비밀번호 없음 → EncryptedDocument
+        match parse_document(&modified) {
+            Err(ParseError::EncryptedDocument) => {}
+            Err(e) => panic!("비밀번호 없는 암호 문서는 EncryptedDocument 이어야 함: {e}"),
+            Ok(_) => panic!("encrypted 플래그가 켜졌으면 파싱이 성공하면 안 됨"),
+        }
+
+        // 2) 비밀번호 제공 (스트림이 실제로 암호화되지 않았으므로 복호화 결과는 쓰레기
+        //    → 압축 해제 실패 → CryptoError::WrongPassword)
+        match parse_document_with_metadata_password(&modified, b"any-password") {
+            Err(ParseError::CryptoError(crypto::CryptoError::WrongPassword)) => {}
+            Err(e) => panic!("틀린 비밀번호는 WrongPassword 여야 함 (다른 에러): {e}"),
+            Ok(_) => panic!("틀린 비밀번호인데 파싱이 성공하면 안 됨"),
+        }
     }
 }

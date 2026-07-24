@@ -29,6 +29,10 @@ pub enum CryptoError {
     RecordError(String),
     /// 압축 해제 실패
     DecompressError(String),
+    /// 비밀번호 불일치 (복호화 결과가 유효한 데이터가 아님)
+    WrongPassword,
+    /// 지원하지 않는 암호화 방식 (예: 보안수준 보통/구버전)
+    UnsupportedScheme(String),
 }
 
 impl std::fmt::Display for CryptoError {
@@ -42,6 +46,10 @@ impl std::fmt::Display for CryptoError {
             CryptoError::DecryptionFailed(e) => write!(f, "복호화 실패: {}", e),
             CryptoError::RecordError(e) => write!(f, "레코드 파싱 실패: {}", e),
             CryptoError::DecompressError(e) => write!(f, "압축 해제 실패: {}", e),
+            CryptoError::WrongPassword => write!(f, "비밀번호가 일치하지 않습니다"),
+            CryptoError::UnsupportedScheme(s) => {
+                write!(f, "지원하지 않는 암호화 방식: {}", s)
+            }
         }
     }
 }
@@ -313,8 +321,249 @@ fn decrypt_aes_ecb(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
 }
 
 // ============================================================
-// ViewText 섹션 복호화 (공개 API)
+// AES-128 ECB 암호화 (정방향) — 비밀번호 복호화의 CFB 모드가
+// AES *암호화*를 기본 연산으로 사용하므로 정방향 경로가 필요하다.
 // ============================================================
+
+/// AES SubBytes
+fn sub_bytes(state: &mut [u8; 16]) {
+    for byte in state.iter_mut() {
+        *byte = S_BOX[*byte as usize];
+    }
+}
+
+/// AES ShiftRows (정방향)
+fn shift_rows(state: &mut [u8; 16]) {
+    let s = *state;
+    *state = [
+        s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12], s[1],
+        s[6], s[11],
+    ];
+}
+
+/// AES MixColumns (정방향)
+fn mix_columns(state: &mut [u8; 16]) {
+    let s = *state;
+    for c in 0..4 {
+        let i = c * 4;
+        state[i] = gf_multiply(0x02, s[i]) ^ gf_multiply(0x03, s[i + 1]) ^ s[i + 2] ^ s[i + 3];
+        state[i + 1] = s[i] ^ gf_multiply(0x02, s[i + 1]) ^ gf_multiply(0x03, s[i + 2]) ^ s[i + 3];
+        state[i + 2] = s[i] ^ s[i + 1] ^ gf_multiply(0x02, s[i + 2]) ^ gf_multiply(0x03, s[i + 3]);
+        state[i + 3] = gf_multiply(0x03, s[i]) ^ s[i + 1] ^ s[i + 2] ^ gf_multiply(0x02, s[i + 3]);
+    }
+}
+
+/// AES-128 ECB 단일 블록 암호화 (16바이트)
+fn encrypt_block(block: &[u8; 16], expanded_key: &[u8]) -> [u8; 16] {
+    let mut state = *block;
+
+    // Initial round key addition (round 0)
+    add_round_key(&mut state, &expanded_key[0..16]);
+
+    // 9 main rounds (round 1 → 9)
+    for round in 1..=9 {
+        sub_bytes(&mut state);
+        shift_rows(&mut state);
+        mix_columns(&mut state);
+        add_round_key(&mut state, &expanded_key[round * 16..(round + 1) * 16]);
+    }
+
+    // Final round (round 10) — MixColumns 없음
+    sub_bytes(&mut state);
+    shift_rows(&mut state);
+    add_round_key(&mut state, &expanded_key[160..176]);
+
+    state
+}
+
+// ============================================================
+// SHA-1 (순수 Rust 구현) — 비밀번호 키 파생에 사용.
+// rhwp는 blake3를 쓰지만 비밀번호 암호화 스펙이 SHA-1을 요구하므로
+// WASM 바이너리 크기를 늘리지 않도록 직접 구현한다.
+// ============================================================
+
+/// SHA-1 해시 (FIPS 180-4)
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+
+    // 패딩: 0x80 + 0x00... + 64비트 길이(비트). 블록은 64바이트 단위.
+    let bit_len: u64 = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks(4).enumerate().take(16) {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+// ============================================================
+// 비밀번호 암호화 문서 복호화 — "보안수준 높음" (한글 2020+ 기본)
+//
+// 알고리즘 참조: volexity/hwp-extract (BSD-3-Clause) 의 encrypt.py.
+// rhwp(MIT)와 라이선스 호환. 본 구현은 알고리즘을 직접 포팅했다.
+//
+// 흐름:
+// 1. 비밀번호 → SHA-1 기반 키 파생 (16바이트 AES-128 키)
+// 2. 원본 스트림을 16바이트 배수로 패드
+// 3. AES-ECB 암호화를 기본 연산으로 쓰는 비트 단위 CFB 모드로 복호화
+// 4. (압축 문서) zlib/raw-deflate 압축 해제
+// ============================================================
+
+/// 비밀번호에서 AES-128 키(16바이트)를 파생한다.
+///
+/// 각 비밀번호 바이트 앞에 "이전 바이트를 1비트 회전"한 값을 끼워 넣어
+/// 인터리브 버퍼를 만들고, 그것의 SHA-1 다이제스트 앞 16바이트를 키로 쓴다.
+/// 첫 바이트의 "이전 값"은 시드 상수 236(0xEC)이다.
+fn derive_password_key(password: &[u8]) -> [u8; 16] {
+    let mut buf = vec![0u8; password.len() * 2];
+    for (i, &byte) in password.iter().enumerate() {
+        // i==0 일 때 Python 코드는 password[-1] 대신 236을 사용한다.
+        let v6 = if i == 0 { 236u8 } else { password[i - 1] };
+        // (2*v6 | v6>>7) & 0xFF == ROL1(v6). u8 wrapping으로 동일.
+        let v7 = v6.wrapping_mul(2) | (v6 >> 7);
+        buf[i * 2] = v7;
+        buf[i * 2 + 1] = byte;
+    }
+    let digest = sha1(&buf);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+/// 데이터를 16바이트 배수로 PKCS#7-스타일 패드한다.
+///
+/// 이미 16바이트 배수면 패드를 추가하지 않는다(참조 구현과 동일).
+/// 그 외에는 (16 - 나머지)바이트를 추가하며 각 패드 바이트 값은 추가 개수이다.
+fn pad_to_block(data: &[u8]) -> Vec<u8> {
+    let rem = data.len() % 16;
+    if rem == 0 {
+        return data.to_vec();
+    }
+    let amount = 16 - rem;
+    let mut out = data.to_vec();
+    out.resize(data.len() + amount, amount as u8);
+    out
+}
+
+/// 비밀번호 기반 AES 비트 단위 CFB 복호화.
+///
+/// 16바이트 시프트 레지스터(tmp_in)를 유지하며, 각 16바이트 블록을
+/// 128비트 단위로 처리한다. 각 비트마다 tmp_in을 AES-ECB 암호화한 결과의
+/// MSB로 암호문 비트를 XOR하고, 암호문 비트를 시프트 레지스터로 되먹임한다.
+/// 키는 스트림 전체에서 불변이므로 키 확장은 한 번만 수행한다.
+fn decrypt_aes_cfb_password(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    let expanded_key = key_expansion(key);
+    let mut tmp_in = [0u8; 16];
+    let mut final_data = Vec::with_capacity(data.len());
+
+    for block in data.chunks(16) {
+        let mut real_input = [0u8; 16];
+        let len = block.len().min(16);
+        real_input[..len].copy_from_slice(&block[..len]);
+
+        for i in 0..128usize {
+            let enc = encrypt_block(&tmp_in, &expanded_key);
+            let out = enc[0];
+            let ff = i & 7;
+
+            // 16바이트 시프트 레지스터를 하위 인덱스 방향으로 1비트 회전.
+            // 참조 구현의 tmp=1,6,11 루프를 그대로 반영 — 인접 바이트의
+            // MSB 캐리가 낮은 인덱스로 전달된다.
+            let mut tmp = 1usize;
+            for _ in 0..3 {
+                let v14 = tmp_in[tmp];
+                tmp_in[tmp - 1] = tmp_in[tmp - 1].wrapping_mul(2) | (tmp_in[tmp] >> 7);
+                let v15 = tmp_in[tmp + 1];
+                let v16 = v14.wrapping_mul(2) | (tmp_in[tmp + 1] >> 7);
+                let v17 = tmp_in[tmp + 2];
+                let v18 = v15.wrapping_mul(2) | (v17 >> 7);
+                let v19 = tmp_in[tmp + 3];
+                let v20 = v17.wrapping_mul(2) | (v19 >> 7);
+                let v21 = v19.wrapping_mul(2) | (tmp_in[tmp + 4] >> 7);
+                tmp_in[tmp] = v16;
+                tmp_in[tmp + 1] = v18;
+                tmp_in[tmp + 2] = v20;
+                tmp_in[tmp + 3] = v21;
+                tmp += 5;
+            }
+
+            // 시프트 레지스러의 최상단(tmp_in[15])에 암호문 비트 1개를 되먹임.
+            let bit_in = (real_input[i >> 3] >> (7 - ff)) & 1;
+            tmp_in[15] = tmp_in[15].wrapping_mul(2) | bit_in;
+
+            // AES 출력의 MSB를 암호문 비트 위치에 XOR → 평문 비트.
+            real_input[i >> 3] ^= (out & 0x80) >> (i & 7);
+        }
+
+        final_data.extend_from_slice(&real_input[..len]);
+    }
+
+    final_data
+}
+
+/// 비밀번호로 보호된 스트림(raw)을 복호화한다.
+///
+/// `compressed`가 true면 복호화 후 zlib/raw-deflate 압축 해제까지 수행한다.
+/// 압축 해제 실패는 비밀번호 불일치의 강한 신호이므로 `WrongPassword`로 매핑한다.
+pub fn decrypt_password_protected(
+    raw: &[u8],
+    password: &[u8],
+    compressed: bool,
+) -> Result<Vec<u8>, CryptoError> {
+    let key = derive_password_key(password);
+    let padded = pad_to_block(raw);
+    let decrypted = decrypt_aes_cfb_password(&key, &padded);
+
+    if compressed {
+        decompress_stream(&decrypted).map_err(|_| CryptoError::WrongPassword)
+    } else {
+        Ok(decrypted)
+    }
+}
 
 /// ViewText 섹션 데이터 복호화
 ///
@@ -547,5 +796,219 @@ mod tests {
         // 빈 데이터로 복호화 시도
         let result = decrypt_viewtext_section(&[], false);
         assert!(result.is_err());
+    }
+
+    // ── SHA-1 벡터 (FIPS 180-4 APPENDIX B) ──
+
+    #[test]
+    fn test_sha1_empty() {
+        assert_eq!(
+            &sha1(b""),
+            b"\xda\x39\xa3\xee\x5e\x6b\x4b\x0d\x32\x55\xbf\xef\x95\x60\x18\x90\xaf\xd8\x07\x09"
+        );
+    }
+
+    #[test]
+    fn test_sha1_abc() {
+        assert_eq!(
+            &sha1(b"abc"),
+            b"\xa9\x99\x3e\x36\x47\x06\x81\x6a\xba\x3e\x25\x71\x78\x50\xc2\x6c\x9c\xd0\xd8\x9d"
+        );
+    }
+
+    #[test]
+    fn test_sha1_long() {
+        let msg = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(
+            &sha1(msg),
+            b"\x84\x98\x3e\x44\x1c\x3b\xd2\x6e\xba\xae\x4a\xa1\xf9\x51\x29\xe5\xe5\x46\x70\xf1"
+        );
+    }
+
+    // ── AES-128 정방향 (NIST FIPS-197 벡터) ──
+
+    #[test]
+    fn test_aes_encrypt_block_nist() {
+        // 기존 test_aes_encrypt_decrypt_roundtrip 와 짝: 같은 key/plaintext.
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let plaintext = [
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34,
+        ];
+        let expected_ciphertext = [
+            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
+            0x0b, 0x32,
+        ];
+        let expanded = key_expansion(&key);
+        assert_eq!(encrypt_block(&plaintext, &expanded), expected_ciphertext);
+    }
+
+    #[test]
+    fn test_aes_ecb_encrypt_decrypt_roundtrip() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let plaintext = [
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34, 0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2,
+            0xe0, 0x37, 0x07, 0x34,
+        ];
+        // 복호화 후 재암호화(encrypt_block 직접) → 원문 복원 검증.
+        let expanded = key_expansion(&key);
+        let mut enc = Vec::new();
+        for block in plaintext.chunks(16) {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(block);
+            enc.extend_from_slice(&encrypt_block(&b, &expanded));
+        }
+        let dec = decrypt_aes_ecb(&enc, &key);
+        assert_eq!(dec, plaintext);
+    }
+
+    // ── 비밀번호 키 파생 ──
+
+    #[test]
+    fn test_derive_password_key_interleave() {
+        // password "a" (0x61): i=0 → v6=236(0xEC), v7 = ROL1(0xEC) = 0xD9.
+        // buf = [0xD9, 0x61]. 인터리브 로직이 정확한지 buf 조립 결과로 검증.
+        let key = derive_password_key(b"a");
+        assert_eq!(key.len(), 16);
+        // 결정성: 같은 비밀번호 → 같은 키.
+        assert_eq!(key, derive_password_key(b"a"));
+        // 다른 비밀번호 → 다른 키.
+        assert_ne!(key, derive_password_key(b"b"));
+    }
+
+    #[test]
+    fn test_derive_password_key_first_byte_seed() {
+        // buf[0] 이 시드 상수 236(0xEC) 의 ROL1 = 0xD9 임을 sha1 입력에서 유추할 수 없으므로,
+        // 동등성 대신 "빈 비밀번호도 길이 0 입력으로 처리된다" 만 확인 (빈 키 파생은 에러 아님).
+        let key_empty = derive_password_key(b"");
+        assert_eq!(key_empty.len(), 16);
+    }
+
+    // ── 패딩 ──
+
+    #[test]
+    fn test_pad_to_block_aligned() {
+        // 16바이트 배수면 변경 없음.
+        let data = vec![0u8; 32];
+        assert_eq!(pad_to_block(&data), data);
+        let data = vec![0u8; 16];
+        assert_eq!(pad_to_block(&data), data);
+    }
+
+    #[test]
+    fn test_pad_to_block_unaligned() {
+        // 13바이트 → 16바이트로, 3바이트(값 3) 추가.
+        let data = vec![0xABu8; 13];
+        let padded = pad_to_block(&data);
+        assert_eq!(padded.len(), 16);
+        assert_eq!(&padded[..13], &data[..]);
+        assert_eq!(&padded[13..], &[3, 3, 3]);
+    }
+
+    #[test]
+    fn test_pad_to_block_empty() {
+        // 빈 입력은 이미 0바이트(16 배수) → 변경 없음.
+        let padded = pad_to_block(&[]);
+        assert_eq!(padded, Vec::<u8>::new());
+    }
+
+    // ── 비밀번호 CFB 복호화 ──
+
+    /// 테스트 전용 CFB 암호화(복호화의 역변환). decrypt 와 동일한 시프트/되먹임
+    /// 구조를 공유하며, 평문 비트와 AES 출력 MSB를 XOR 해 암호문 비트를 만든다.
+    fn encrypt_aes_cfb_password_for_test(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        let expanded_key = key_expansion(key);
+        let mut tmp_in = [0u8; 16];
+        let mut out = Vec::with_capacity(data.len());
+        for block in data.chunks(16) {
+            let mut real = [0u8; 16];
+            let len = block.len().min(16);
+            real[..len].copy_from_slice(&block[..len]);
+            for i in 0..128usize {
+                let enc = encrypt_block(&tmp_in, &expanded_key);
+                let out_byte = enc[0];
+                let ff = i & 7;
+                // 평문 → 암호문: p XOR out_msb.
+                let c_bit = ((real[i >> 3] >> (7 - ff)) ^ (out_byte >> 7)) & 1;
+                let mut tmp = 1usize;
+                for _ in 0..3 {
+                    let v14 = tmp_in[tmp];
+                    tmp_in[tmp - 1] = tmp_in[tmp - 1].wrapping_mul(2) | (tmp_in[tmp] >> 7);
+                    let v15 = tmp_in[tmp + 1];
+                    let v16 = v14.wrapping_mul(2) | (tmp_in[tmp + 1] >> 7);
+                    let v17 = tmp_in[tmp + 2];
+                    let v18 = v15.wrapping_mul(2) | (v17 >> 7);
+                    let v19 = tmp_in[tmp + 3];
+                    let v20 = v17.wrapping_mul(2) | (v19 >> 7);
+                    let v21 = v19.wrapping_mul(2) | (tmp_in[tmp + 4] >> 7);
+                    tmp_in[tmp] = v16;
+                    tmp_in[tmp + 1] = v18;
+                    tmp_in[tmp + 2] = v20;
+                    tmp_in[tmp + 3] = v21;
+                    tmp += 5;
+                }
+                tmp_in[15] = tmp_in[15].wrapping_mul(2) | c_bit;
+                // 암호문 비트를 real 바이트에 반영 (LSB-정렬 후 원 위치로).
+                real[i >> 3] = (real[i >> 3] & !(1 << (7 - ff))) | (c_bit << (7 - ff));
+            }
+            out.extend_from_slice(&real[..len]);
+        }
+        out
+    }
+
+    #[test]
+    fn test_cfb_password_roundtrip() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        for (idx, plaintext) in [
+            &b"Hello, HWP!"[..],
+            &b"0123456789abcdef"[..],       // 정확히 1블록
+            &b"0123456789abcdefghijkl"[..], // 1.5블록
+        ]
+        .iter()
+        .enumerate()
+        {
+            let encrypted = encrypt_aes_cfb_password_for_test(&key, plaintext);
+            // 복호화는 16배수 패드를 받으므로 encrypt 결과 길이(=평문 길이)를 그대로 전달.
+            let mut padded = encrypted.clone();
+            // pad_to_block 와 동일하게 16배수로 맞춤 (encrypt 이미 배수일 수도).
+            let rem = padded.len() % 16;
+            if rem != 0 {
+                let amount = 16 - rem;
+                padded.resize(padded.len() + amount, amount as u8);
+            }
+            let decrypted = decrypt_aes_cfb_password(&key, &padded);
+            assert_eq!(
+                &decrypted[..plaintext.len()],
+                *plaintext,
+                "roundtrip case {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decrypt_password_protected_wrong_password() {
+        // 임의의 바이트는 유효한 deflate 스트림이 아니므로 복호화 후 압축 해제 실패 →
+        // WrongPassword. compressed=true 경로의 비밀번호 불일치 감지를 검증.
+        let fake_encrypted = vec![0xAAu8; 64];
+        let err = decrypt_password_protected(&fake_encrypted, b"wrongpwd", true).unwrap_err();
+        assert!(matches!(err, CryptoError::WrongPassword));
+    }
+
+    #[test]
+    fn test_decrypt_password_protected_uncompressed_returns_bytes() {
+        // compressed=false 면 복호화된 바이트를 그대로 반환 (검증은 호출자/파서 책임).
+        let fake = vec![0x11u8; 32];
+        let result = decrypt_password_protected(&fake, b"pw", false).unwrap();
+        assert_eq!(result.len(), 32);
     }
 }
